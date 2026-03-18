@@ -1,6 +1,6 @@
 # OpenDsStar
 
-**OpenDsStar** is an open-source implementation of the **[DS-Star agent](https://arxiv.org/abs/2509.21825)**, with several deliberate design enhancements that improve modularity, extensibility, and execution efficiency.
+**OpenDsStar** is an open-source implementation of the **[DS-Star agent](https://arxiv.org/abs/2509.21825)** (Nam et al., 2025), with several deliberate design enhancements that improve modularity, extensibility, and execution efficiency.
 
 The original DS-Star agent is primarily built around **file-based artifacts**: reasoning, planning, and execution revolve around reading, writing, and modifying files that represent intermediate and final results. OpenDsStar preserves the core planning-and-coding philosophy of DS-Star, but redefines the execution model around a **tool-centric abstraction**.
 
@@ -48,14 +48,6 @@ OpenDsStar supports two execution modes:
   Produces plans incrementally and executes only the newest step while reusing outputs from previous steps. This mode is more efficient when steps are expensive or computationally heavy.
 
 ## Installation
-
-### From PyPI (Recommended)
-
-```bash
-pip install opendsstar
-```
-
-### From Source
 
 ```bash
 git clone https://github.com/IBM/OpenDsStar.git
