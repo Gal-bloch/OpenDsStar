@@ -92,14 +92,16 @@ import logging
 import math
 import multiprocessing
 import pickle
+import platform
 import queue
 import random
+import resource
 import statistics
 import sys
 import threading
 import time
 import traceback
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any, Callable, Dict, Optional, Tuple
 
 import numpy as np
@@ -119,6 +121,15 @@ from agents.ds_star.ds_star_utils import (
 from agents.utils.safe_imports import get_safe_builtins, get_safe_scientific_env
 
 logger = logging.getLogger(__name__)
+
+# Default maximum virtual memory (address space) for the child process.
+# Prevents generated code from consuming unbounded memory (e.g. [0]*10**9).
+# Must be large enough to accommodate the Python interpreter + preloaded
+# scientific libraries (numpy, pandas, scipy, plotly ≈ 1–1.5 GB virtual).
+# Set to 0 to disable the limit.
+# Note: Only enforced on Linux. macOS does not support RLIMIT_AS enforcement.
+# Can be overridden per-call via the max_memory_bytes parameter.
+DEFAULT_MAX_CHILD_MEMORY_BYTES: int = 1 * 1024 * 1024 * 1024  # 1 GB
 
 
 class TimeoutException(Exception):
@@ -172,7 +183,7 @@ def _build_base_env() -> Dict[str, Any]:
         "pandas": pd,
         "scipy": sp,
         "sp": sp,
-        "Path": Path,
+        "Path": PurePath,
         "json": json,
         "traceback": traceback,
         "plotly": plotly,
@@ -630,6 +641,7 @@ def _execute_code_in_process(
     result_queue: multiprocessing.Queue,
     tool_conn: Any,
     tool_names: list[str],
+    max_memory_bytes: int = 0,
 ) -> None:
     """
     Execute generated code in the child process and return results by queue.
@@ -646,6 +658,22 @@ def _execute_code_in_process(
     - Tools are not executed here; instead, named proxy callables are injected.
     - stdout/stderr are captured and returned as logs.
     """
+    # Enforce memory limit on the child process (Linux only).
+    if max_memory_bytes > 0 and platform.system() == "Linux":
+        try:
+            _, hard = resource.getrlimit(resource.RLIMIT_AS)
+            new_soft = (
+                min(max_memory_bytes, hard)
+                if hard != resource.RLIM_INFINITY
+                else max_memory_bytes
+            )
+            resource.setrlimit(resource.RLIMIT_AS, (new_soft, hard))
+        except (ValueError, OSError) as exc:
+            # Non-fatal: log and continue without memory limit.
+            # Can fail if the requested limit is below current usage or
+            # if the OS doesn't support RLIMIT_AS.
+            logger.warning("Could not set child memory limit: %s", exc)
+
     stdout_buf = io.StringIO()
     stderr_buf = io.StringIO()
     old_stdout, old_stderr = sys.stdout, sys.stderr
@@ -679,7 +707,7 @@ def _execute_code_in_process(
             logs += "\n[STDERR]\n" + err
 
         result_queue.put(("success", logs.strip(), outputs))
-    except Exception as exc:
+    except (Exception, SystemExit) as exc:
         tb = traceback.format_exc(limit=8)
         logs = stdout_buf.getvalue()
         err = stderr_buf.getvalue()
@@ -709,6 +737,7 @@ def run_code_with_timeout(
     seconds: int,
     tools_dict: Optional[Dict[str, Any]] = None,
     normalize_tool_result: Optional[Callable[[Any], Any]] = None,
+    max_memory_bytes: int = DEFAULT_MAX_CHILD_MEMORY_BYTES,
 ) -> tuple[str, Dict[str, Any]]:
     """
     Execute code in a separate process with hard timeout enforcement.
@@ -738,6 +767,10 @@ def run_code_with_timeout(
         normalize_tool_result:
             Optional normalizer applied in the parent when tools return simple
             display-oriented values.
+        max_memory_bytes:
+            Maximum virtual memory for the child process in bytes.
+            Set to 0 to disable. Only enforced on Linux.
+            Defaults to DEFAULT_MAX_CHILD_MEMORY_BYTES (2 GB).
 
     Returns:
         (logs, outputs)
@@ -764,9 +797,9 @@ def run_code_with_timeout(
     tools_dict = tools_dict or {}
 
     try:
-        ctx = multiprocessing.get_context("fork")
-    except ValueError:
         ctx = multiprocessing.get_context("spawn")
+    except ValueError:
+        ctx = multiprocessing.get_context("fork")
 
     result_queue: multiprocessing.Queue = ctx.Queue()  # type: ignore
     parent_conn, child_conn = ctx.Pipe(duplex=True)  # type: ignore
@@ -787,6 +820,7 @@ def run_code_with_timeout(
             result_queue,
             child_conn,
             list(tools_dict.keys()),
+            max_memory_bytes,
         ),
         daemon=True,
     )
@@ -858,6 +892,7 @@ def execute_user_code(
     state: DSState,
     tools: Dict[str, Any],
     timeout: int = 30,
+    max_memory_bytes: int = DEFAULT_MAX_CHILD_MEMORY_BYTES,
 ) -> Tuple[str, Dict[str, Any]]:
     """
     Execute generated user code with safety checks, tool access, and timeout.
@@ -923,6 +958,7 @@ def execute_user_code(
             seconds=timeout,
             tools_dict=tools,
             normalize_tool_result=normalize_tool_result,
+            max_memory_bytes=max_memory_bytes,
         )
         logger.info("Code execution finished.")
         return logs.strip(), outputs
