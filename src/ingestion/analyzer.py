@@ -4,7 +4,7 @@ Build document descriptions using the analyzer agent for code-based analysis.
 
 import logging
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from docling_core.types.io import DocumentStream
 from langchain_core.documents import Document
@@ -19,6 +19,7 @@ from agents.analyzer.analyzer_graph import (
     prepare_result_from_graph_state_analyzer_agent,
 )
 
+from .docling_cache import AnalyzerDescriptionCache
 from .document_description_builder import DocumentDescriptionBuilder
 
 logger = logging.getLogger(__name__)
@@ -39,6 +40,8 @@ class AnalyzerDescriptionBuilder(DocumentDescriptionBuilder):
         max_debug_tries: int = 3,
         embedding_model: str = "ibm-granite/granite-embedding-english-r2",
         db_uri: str = "./milvus_analyzer.db",
+        cache_dir: Optional[str | Path] = None,
+        enable_caching: bool = True,
     ):
         """
         Initialize the analyzer document processor.
@@ -49,7 +52,10 @@ class AnalyzerDescriptionBuilder(DocumentDescriptionBuilder):
             max_debug_tries: Maximum number of debug attempts
             embedding_model: HuggingFace model name for embeddings
             db_uri: Path to Milvus database file
+            cache_dir: Directory for caching analysis results. If None, caching is disabled.
+            enable_caching: Whether to enable caching (requires cache_dir).
         """
+        llm_model_name = llm if isinstance(llm, str) else getattr(llm, "model", llm.__class__.__name__)
         if isinstance(llm, str):
             llm = ChatLiteLLM(model=llm)
         self.analyzer_graph = AnalyzerGraph(
@@ -59,6 +65,16 @@ class AnalyzerDescriptionBuilder(DocumentDescriptionBuilder):
         )
         self.embedding_model = embedding_model
         self.db_uri = db_uri
+
+        # Initialize description cache
+        use_cache = enable_caching and cache_dir is not None
+        self.description_cache = AnalyzerDescriptionCache(
+            cache_base_dir=Path(cache_dir) if cache_dir else Path("."),
+            llm_model=llm_model_name,
+            code_timeout=code_timeout,
+            max_debug_tries=max_debug_tries,
+            enabled=use_cache,
+        )
 
     def _process_files(
         self, file_paths: list[Path], analysis_results: dict[str, Dict[str, Any]]
@@ -74,10 +90,21 @@ class AnalyzerDescriptionBuilder(DocumentDescriptionBuilder):
             Tuple of (vector_db, analysis_results, document_streams)
         """
         document_streams = {}
+        cached_count = 0
+        analyzed_count = 0
 
         for file_path in file_paths:
             file_path = Path(file_path)
             logger.info(f"Analyzing file: {file_path.name}")
+
+            # Check cache first
+            cached_result = self.description_cache.get(file_path)
+            if cached_result is not None:
+                logger.info(f"Cache hit for {file_path.name}")
+                analysis_results[file_path.name] = cached_result
+                document_streams[file_path.name] = None
+                cached_count += 1
+                continue
 
             try:
                 # Run the analyzer graph
@@ -89,9 +116,14 @@ class AnalyzerDescriptionBuilder(DocumentDescriptionBuilder):
                 result["file_path"] = str(file_path.absolute())
                 analysis_results[file_path.name] = result
 
+                # Cache only successful results
+                if result.get("success", False):
+                    self.description_cache.put(file_path, result)
+
                 # Create a simple DocumentStream placeholder
                 # (analyzer doesn't produce actual DocumentStream objects)
                 document_streams[file_path.name] = None
+                analyzed_count += 1
 
             except Exception as e:
                 logger.warning(f"Failed to analyze file {file_path.name}: {e}")
@@ -103,6 +135,14 @@ class AnalyzerDescriptionBuilder(DocumentDescriptionBuilder):
                     "outputs": {},
                     "file_path": str(file_path.absolute()),
                 }
+                analyzed_count += 1
+
+        logger.info(
+            "Analysis complete: total=%d cached=%d analyzed=%d",
+            len(file_paths),
+            cached_count,
+            analyzed_count,
+        )
 
         # Create vector database
         vector_db = Milvus(

@@ -288,3 +288,127 @@ class FileDescriptionCache:
             logger.info("Cleared file description cache")
         except Exception as e:
             logger.warning(f"Failed to clear cache: {e}")
+
+
+class AnalyzerDescriptionCache:
+    """
+    Cache for analyzer agent description results.
+
+    Caches the final description (logs output) produced by the AnalyzerGraph
+    for each file. Cache key is based on file path and modification time so
+    that changed files are re-analyzed automatically.
+
+    Cache structure:
+        <cache_base_dir>/analyzer_descriptions_<llm_hash>/
+    """
+
+    def __init__(
+        self,
+        cache_base_dir: Path | str,
+        llm_model: str = "",
+        code_timeout: int = 30,
+        max_debug_tries: int = 3,
+        enabled: bool = True,
+    ):
+        self.cache_base_dir = Path(cache_base_dir)
+        self.enabled = enabled
+        self.llm_model = llm_model
+        self.code_timeout = code_timeout
+        self.max_debug_tries = max_debug_tries
+
+        if self.enabled:
+            self.cache_base_dir.mkdir(parents=True, exist_ok=True)
+            config_hash = self._generate_config_hash()
+            cache_dir_name = f"analyzer_descriptions_{config_hash}"
+            self.cache_path = self.cache_base_dir / cache_dir_name
+            self.cache_path.mkdir(parents=True, exist_ok=True)
+            logger.info(
+                "Analyzer description cache initialized at: %s", self.cache_path
+            )
+
+    def _generate_config_hash(self) -> str:
+        """
+        Generate a hash from all parameters that affect analysis results:
+        LLM model, code_timeout, and max_debug_tries.
+        """
+        config_str = (
+            f"model={self.llm_model}_"
+            f"timeout={self.code_timeout}_"
+            f"debug={self.max_debug_tries}"
+        )
+        return hashlib.sha256(config_str.encode()).hexdigest()[:16]
+
+    def _get_file_cache_key(self, file_path: Path) -> str:
+        """
+        Generate cache key for a specific file based on path and mtime.
+
+        Args:
+            file_path: Path to the file
+
+        Returns:
+            Cache key string
+        """
+        abs_path = str(file_path.resolve())
+        try:
+            mtime = file_path.stat().st_mtime
+        except Exception:
+            mtime = 0
+
+        key_str = f"{abs_path}_{mtime}"
+        return hashlib.sha256(key_str.encode()).hexdigest()
+
+    def get(self, file_path: Path) -> Dict[str, Any] | None:
+        """
+        Retrieve cached analysis result for a file.
+
+        Args:
+            file_path: Path to the file
+
+        Returns:
+            The cached result dict if present, None otherwise.
+        """
+        if not self.enabled:
+            return None
+
+        cache_key = self._get_file_cache_key(file_path)
+        try:
+            with FileCache(self.cache_path) as cache:
+                result = cache.get(cache_key)
+                if result is not None:
+                    logger.debug("Analyzer cache hit for %s", file_path.name)
+                    return result
+        except Exception as e:
+            logger.warning("Failed to load analyzer cache for %s: %s", file_path.name, e)
+
+        return None
+
+    def put(self, file_path: Path, result: Dict[str, Any]) -> None:
+        """
+        Store an analysis result in the cache.
+
+        Args:
+            file_path: Path to the analyzed file
+            result: The result dict produced by the analyzer graph
+        """
+        if not self.enabled:
+            return
+
+        cache_key = self._get_file_cache_key(file_path)
+        try:
+            with FileCache(self.cache_path) as cache:
+                cache.put(cache_key, result)
+            logger.debug("Cached analyzer result for %s", file_path.name)
+        except Exception as e:
+            logger.warning("Failed to cache analyzer result for %s: %s", file_path.name, e)
+
+    def clear(self) -> None:
+        """Clear all cached analyzer results."""
+        if not self.enabled:
+            return
+
+        try:
+            with FileCache(self.cache_path) as cache:
+                cache.clear()
+            logger.info("Cleared analyzer description cache")
+        except Exception as e:
+            logger.warning("Failed to clear analyzer cache: %s", e)
