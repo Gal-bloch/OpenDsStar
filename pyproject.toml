@@ -91,7 +91,6 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["agents*", "experiments*", "tools*", "ingestion*", "runner*", "core*"]
 namespaces = false
 
 [tool.isort]
